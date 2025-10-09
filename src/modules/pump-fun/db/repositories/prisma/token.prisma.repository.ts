@@ -6,14 +6,22 @@ export class TokenPrismaRepository {
   constructor(private readonly prisma: PrismaService) { }
 
   async saveToken(data: any) {
-    await this.prisma.token.create({
+    return await this.prisma.token.create({
       data: {
+        signature: data.signature,
         type: data.type,
-        mint: data.mint,
+
         name: data.name,
         symbol: data.symbol,
         creator: data.creator,
-        signature: data.signature,
+        bodingCurve: data.bondingCurve,
+
+        action: data.action,
+        solAmonut: data.solAmount,
+        tokenAmount: data.tokenAmount,
+
+        mint: data.mint,
+
         slot: data.slot,
         timestamp: data.timestamp,
       }

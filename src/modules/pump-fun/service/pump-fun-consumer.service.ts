@@ -5,21 +5,31 @@ import { CreateParser } from "src/modules/pump-fun/parsers/create-parser";
 import { PumpFunEventType } from "src/modules/pump-fun/types/pump-fun-event.type";
 import { EventClassifier } from "src/modules/pump-fun/utils/event-classifier";
 import { TokenPrismaRepository } from "../db/repositories/prisma/token.prisma.repository";
+import Redis from "ioredis";
+import bs58 from 'bs58';
+import { StatisticsService } from "src/modules/statistics/services/statistics.service";
 
 @Processor('pump-fun-event', { concurrency: 10, limiter: { max: 10, duration: 1000 } })
 export class PumpFunConsumerService extends WorkerHost {
+  private redisPub: Redis;
+
   private connection: Connection
   private readonly PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P')
 
   constructor(
     private readonly tokenRepository: TokenPrismaRepository,
+    private readonly statisticsService: StatisticsService,
   ) {
     super();
+    this.redisPub = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+    })
+
     this.connection = new Connection(
       process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
       { commitment: 'confirmed' }
     )
-
   }
 
   async process(job: Job): Promise<any> {
@@ -39,14 +49,34 @@ export class PumpFunConsumerService extends WorkerHost {
       switch (eventType) {
         case PumpFunEventType.CREATE: {
           parsedEvent = await this.parseCreateEvent(logs, signature, baseData)
-          await this.tokenRepository.saveToken(parsedEvent)
-          console.log(parsedEvent);
+
+          const savedToken = await this.tokenRepository.saveToken(parsedEvent)
+          await this.redisPub.publish('token:created', JSON.stringify(savedToken, (_, value) =>
+            typeof value === 'bigint' ? value.toString() : value
+          ));
+
+          await this.statisticsService.incrementTokensCreated()
+          await this.statisticsService.incrementTransaction()
+          await this.statisticsService.publishStats()
+
+          console.log(savedToken);
           break
         }
 
-        case PumpFunEventType.TRADE:
-          console.log(logs);
-          return { status: 'skipped', reason: 'trade_event_not_implemented' };
+        case PumpFunEventType.TRADE: {
+          parsedEvent = this.parseTradeEvent(logs, signature, baseData);
+          const savedTrade = await this.tokenRepository.saveToken(parsedEvent);
+
+          await this.statisticsService.incrementTransaction()
+          await this.statisticsService.publishStats()
+
+          console.log(savedTrade);
+
+          await this.redisPub.publish('trade:detected', JSON.stringify(savedTrade, (_, value) =>
+            typeof value === 'bigint' ? value.toString() : value
+          ));
+          break;
+        }
         default:
           return { status: 'skipped', reason: 'unhandled_event_type' };
       }
@@ -64,14 +94,115 @@ export class PumpFunConsumerService extends WorkerHost {
   }
 
   private async parseCreateEvent(logs: string[], signature: string, baseData: any) {
-    // const lightweightData = this.parseFromLogs(logs);
-
-    // if (lightweightData.complete) return { ...lightweightData, ...baseData };
-
     const tx = await this.safeGetTransaction(signature);
     if (!tx) return null;
 
     return CreateParser.parse(tx, this.PUMP_FUN_PROGRAM_ID, baseData);
+  }
+
+  private parseTradeEvent(logs: string[], signature: string, baseData: any) {
+    const action: 'BUY' | 'SELL' = logs.includes('Buy') ? 'BUY' : 'SELL';
+    const programDataLog = logs.find(log => log.startsWith('Program data: '));
+
+    const result = {
+      type: PumpFunEventType.TRADE,
+      action,
+      ...baseData
+    };
+
+    if (programDataLog) {
+      const dataMatch = programDataLog.match(/Program data: (.+)/);
+      if (dataMatch) {
+        result.programData = dataMatch[1];
+        try {
+          const decoded = this.decodeProgramData(dataMatch[1]);
+
+          if (!decoded) return result;
+
+          return {
+            ...result,
+            mint: decoded.mint,
+            solAmount: decoded.solAmount,
+            tokenAmount: decoded.tokenAmount,
+            isBuy: decoded.isBuy,
+            virtualSolReserves: decoded.virtualSolReserves,
+            virtualTokenReserves: decoded.virtualTokenReserves,
+            realSolReserves: decoded.realSolReserves,
+            realTokenReserves: decoded.realTokenReserves,
+          }
+        } catch (e) {
+          console.error('Failed to decode program data:', e);
+        }
+
+      }
+    }
+
+    return result;
+  }
+
+  private decodeProgramData(base64Data: string) {
+    try {
+      const buffer = Buffer.from(base64Data, 'base64');
+
+      if (buffer.length < 96) {
+        console.warn('Program data too short:', buffer.length);
+        return null;
+      }
+
+      let offset = 8;
+
+      const mintBytes = buffer.subarray(offset, offset + 32);
+      const mint = bs58.encode(mintBytes);
+      offset += 32;
+
+      const solAmountLamports = this.readU64LE(buffer, offset);
+      const solAmount = solAmountLamports / 1e9; // Converte lamports para SOL
+      offset += 8;
+
+      const tokenAmountRaw = this.readU64LE(buffer, offset);
+      const tokenAmount = tokenAmountRaw / 1e9;
+      offset += 8;
+
+      const isBuy = buffer.readUInt8(offset) === 1;
+      offset += 8;
+
+      const virtualSolReserves = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const virtualTokenReserves = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const realSolReserves = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const realTokenReserves = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      return {
+        mint,
+        solAmount,
+        tokenAmount,
+        isBuy,
+        virtualSolReserves,
+        virtualTokenReserves,
+        realSolReserves,
+        realTokenReserves,
+      };
+
+    } catch (e) {
+      console.error('Error decoding base64 program data:', e);
+      return null;
+    }
+  }
+
+  private readU64LE(buffer: Buffer, offset: number): number {
+    // Lê 8 bytes como BigInt Little Endian
+    const low = buffer.readUInt32LE(offset);
+    const high = buffer.readUInt32LE(offset + 4);
+    const value = BigInt(high) * BigInt(0x100000000) + BigInt(low);
+
+    // Converte para number (cuidado com overflow para valores muito grandes)
+    return Number(value);
   }
 
   private parseFromLogs(logs: string[]) {
@@ -122,4 +253,6 @@ export class PumpFunConsumerService extends WorkerHost {
     }
     return null;
   }
+
+
 }
