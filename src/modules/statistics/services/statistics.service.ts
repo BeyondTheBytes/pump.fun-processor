@@ -41,7 +41,6 @@ export class StatisticsService {
   }
 
   async getStats(): Promise<Statistics> {
-    // Tenta pegar eventsInDb do cache
     let eventsInDb = await this.redisPub.get('stats:dbCount');
 
     if (!eventsInDb) {

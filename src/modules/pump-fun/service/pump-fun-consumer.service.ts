@@ -156,7 +156,7 @@ export class PumpFunConsumerService extends WorkerHost {
       offset += 32;
 
       const solAmountLamports = this.readU64LE(buffer, offset);
-      const solAmount = solAmountLamports / 1e9; // Converte lamports para SOL
+      const solAmount = solAmountLamports / 1e9;
       offset += 8;
 
       const tokenAmountRaw = this.readU64LE(buffer, offset);
@@ -201,7 +201,6 @@ export class PumpFunConsumerService extends WorkerHost {
     const high = buffer.readUInt32LE(offset + 4);
     const value = BigInt(high) * BigInt(0x100000000) + BigInt(low);
 
-    // Converte para number (cuidado com overflow para valores muito grandes)
     return Number(value);
   }
 
