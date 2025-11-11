@@ -3,4 +3,5 @@ export interface Statistics {
   tokensCreatedSinceUp: number;
   totalTransactions: number;
   tradesPerSecond: number;
+  tokenGraduated: number;
 }

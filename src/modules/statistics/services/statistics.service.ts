@@ -30,6 +30,10 @@ export class StatisticsService {
     this.startPeriodicEmission();
   }
 
+  async incrementDbCount() {
+    await this.redisPub.incr('stats:dbCount');
+  }
+
   async incrementTokensCreated() {
     await this.redisPub.incr('stats:tokensCreated');
 
@@ -40,17 +44,15 @@ export class StatisticsService {
     await this.redisPub.zadd('stats:tradeTimestamps', Date.now(), uuidV4());
   }
 
+  async incrementTokenGraduated() {
+    await this.redisPub.incr('stats:tokensGraduated');
+  }
+
   async getStats(): Promise<Statistics> {
-    let eventsInDb = await this.redisPub.get('stats:dbCount');
-
-    if (!eventsInDb) {
-      const count = await this.prisma.token.count();
-      await this.redisPub.set('stats:dbCount', count, 'EX', 10);
-      eventsInDb = count.toString();
-    }
-
+    const eventsInDb = await this.redisPub.get('stats:dbCount');
     const tokensCreated = await this.redisPub.get('stats:tokensCreated');
     const totalTransactions = await this.redisPub.get('stats:totalTransactions');
+    const tokenGraduated = await this.redisPub.get('stats:tokensGraduated');
 
     const oneSecondAgo = Date.now() - 1000;
     const tradesPerSecond = await this.redisPub.zcount(
@@ -60,9 +62,10 @@ export class StatisticsService {
     );
 
     return {
-      eventsInDb: parseInt(eventsInDb) || 0,
+      eventsInDb: parseInt(eventsInDb || '0'),
       tokensCreatedSinceUp: parseInt(tokensCreated || '0'),
       totalTransactions: parseInt(totalTransactions || '0'),
+      tokenGraduated: parseInt(tokenGraduated || '0'),
       tradesPerSecond,
     };
   }
@@ -90,6 +93,7 @@ export class StatisticsService {
   async reset() {
     await this.redisPub.del('stats:tokensCreated');
     await this.redisPub.del('stats:totalTransactions');
+    await this.redisPub.del('stats:tokensGraduated');
     await this.redisPub.del('stats:tradeTimestamps');
     await this.redisPub.del('stats:dbCount');
   }
