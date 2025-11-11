@@ -7,7 +7,6 @@ async function bootstrap() {
   if (ClusterService.isWorker()) {
     const app = await NestFactory.createApplicationContext(AppModule);
     app.enableShutdownHooks();
-    console.log(`Worker ${process.pid} started (Queue Processor)`);
     return;
   }
 
@@ -23,7 +22,6 @@ async function bootstrap() {
   app.enableShutdownHooks();
 
   await app.listen(3001, '0.0.0.0')
-  console.log(`Worker ${process.pid} started`);
 }
 
 ClusterService.clusterize(bootstrap, 10);

@@ -14,10 +14,6 @@ export class ClusterService {
     const numWorkers = workersCount || os.cpus().length;
 
     if (clusterWorker.isPrimary) {
-      console.log('Pump.fun Worker Server (Clustered)\n');
-      console.log(`CPU Cores: ${os.cpus().length}`);
-      console.log(`Starting ${numWorkers} workers...\n`);
-
       for (let i = 0; i < numWorkers; i++) {
         clusterWorker.fork();
       }
