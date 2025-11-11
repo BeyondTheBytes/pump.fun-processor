@@ -1,49 +1,83 @@
-import { PublicKey, VersionedTransactionResponse } from '@solana/web3.js';
-import { PumpFunEventType } from 'src/modules/pump-fun/types/pump-fun-event.type';
-import { BufferReader } from 'src/modules/pump-fun/utils/buffer-reader';
+import { PublicKey } from "@solana/web3.js";
+import { PumpFunEventType } from "../types/pump-fun-event.type";
 
 export class CreateParser {
-  static parse(tx: VersionedTransactionResponse, programId: PublicKey, baseData: any) {
+  static parseFromLogs(
+    logs: string[],
+    programId: PublicKey,
+    baseData: { signature: string; slot: number; timestamp: Date }
+  ) {
     try {
-      const pumpInstruction = tx.transaction.message.compiledInstructions.find((instr) => {
-        const instrProgramId = tx.transaction.message.staticAccountKeys[instr.programIdIndex];
-        return instrProgramId.equals(programId);
-      })
+      const programDataLog = logs.find((l) => l.startsWith("Program data:"));
+      if (!programDataLog) {
+        console.warn(`[CreateParser] Nenhum "Program data" encontrado para ${baseData.signature}`);
+        return { type: PumpFunEventType.CREATE, complete: false, ...baseData };
+      }
 
-      if (!pumpInstruction) return null;
+      const base64Data = programDataLog.replace("Program data:", "").trim();
+      const buffer = Buffer.from(base64Data, "base64");
 
-      const dataBuffer = Buffer.from(pumpInstruction.data);
+      if (buffer.length < 8) {
+        console.warn(`[CreateParser] Program data too short: ${buffer.length}`);
+        return { type: PumpFunEventType.CREATE, complete: false, ...baseData };
+      }
 
-      const bufferReader = new BufferReader(dataBuffer);
+      let offset = 8; // pula o discriminator (8 bytes padrão Anchor)
 
-      const tokenName = bufferReader.readLengthPrefixedString().value;
-      const symbol = bufferReader.readLengthPrefixedString().value;
-      const uri = bufferReader.readLengthPrefixedString().value;
+      const safeReadU32 = (): number => {
+        if (offset + 4 > buffer.length) throw new Error("Out of range while reading u32");
+        const v = buffer.readUInt32LE(offset);
+        offset += 4;
+        return v;
+      };
 
-      const accountKeys = tx.transaction.message.staticAccountKeys;
+      const safeReadString = (): string => {
+        const len = safeReadU32();
+        if (len > 1024) throw new Error(`Invalid string length (${len})`);
+        if (offset + len > buffer.length) throw new Error("Out of range while reading string");
+        const str = buffer.subarray(offset, offset + len).toString("utf8");
+        offset += len;
+        return str;
+      };
 
-      const mint = accountKeys[1].toBase58();
-      const [bondingCurve] = PublicKey.findProgramAddressSync([
-        Buffer.from("bonding-curve"),
-        new PublicKey(mint).toBuffer(),
-      ],
-        programId
-      )
-      const user = accountKeys[0].toBase58();
+      const safeReadPubkey = (): string => {
+        if (offset + 32 > buffer.length) throw new Error("Out of range while reading pubkey");
+        const pk = new PublicKey(buffer.subarray(offset, offset + 32)).toBase58();
+        offset += 32;
+        return pk;
+      };
 
+      // ---- layout manual baseado no PumpFun create ----
+      const name = safeReadString();
+      const symbol = safeReadString();
+      const uri = safeReadString();
+      const mint = safeReadPubkey();
+      const bondingCurve = safeReadPubkey();
+
+      // ⚠️ Novo: o criador vem logo após o bondingCurve
+      let creator: string | undefined;
+      if (offset + 32 <= buffer.length) {
+        creator = safeReadPubkey();
+      }
+
+      // se chegou até aqui, é um create completo
       return {
         type: PumpFunEventType.CREATE,
-        mint,
-        name: tokenName,
+        complete: true,
+        name,
         symbol,
         uri,
-        bondingCurve: bondingCurve.toBase58(),
-        creator: user,
+        mint,
+        bondingCurve,
+        creator,
         ...baseData,
       };
-    } catch (error) {
-      console.error('Error parsing CREATE event:', error);
-      return null;
+    } catch (err: any) {
+      // Erros tratados e logados, mas o worker continua
+      console.error(
+        `[CreateParser] Error decoding base64 program data: ${err.message}`
+      );
+      return { type: PumpFunEventType.CREATE, complete: false, ...baseData };
     }
   }
 }
