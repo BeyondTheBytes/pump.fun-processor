@@ -25,6 +25,7 @@ export class PumpFunEventsGateway implements OnGatewayConnection, OnGatewayDisco
 
   async onModuleInit() {
     await this.redisSubs.subscribe('token:created');
+    await this.redisSubs.subscribe('token:athUpdated');
     await this.redisSubs.subscribe('trade:detected');
     await this.redisSubs.subscribe('stats:update');
 
@@ -42,6 +43,13 @@ export class PumpFunEventsGateway implements OnGatewayConnection, OnGatewayDisco
 
         case 'stats:update':
           this.server?.emit('stats:update', payload);
+          break;
+
+        case 'token:athUpdated':
+          this.server?.emit('token:athUpdated', payload);
+          break;
+
+        default:
           break;
       }
     })
