@@ -16,11 +16,11 @@ model Token {
   name        String?
   symbol      String?
   creator     String?
-  bodingCurve String?
+  bodingCurve String? @map("boding_curve")
 
   action      String?
-  solAmonut   Float?
-  tokenAmount Float?
+  solAmonut   Float?  @map("sol_amonut")
+  tokenAmount Float?  @map("token_amount")
 
   mint String
 
@@ -30,4 +30,90 @@ model Token {
   @@index([mint])
   @@index([type])
   @@index([type, action])
+  @@map("token")
+}
+
+model CreatedTokenEvent {
+  id           String   @id @default(cuid())
+  type         String
+  signature    String   @unique
+  slot         BigInt
+  timestamp    DateTime
+  mint         String
+  creator      String?
+  name         String?
+  symbol       String?
+  uri          String?
+  bondingCurve String?  @map("bonding_curve")
+  // any other “create”-specific fields you can add here, e.g. initialSupply, metadataAccount, etc
+
+  @@index([mint])
+  @@index([type])
+  @@index([slot])
+  @@index([timestamp])
+  @@map("created_token_event")
+}
+
+model TradeTokenEvent {
+  id                   String   @id @default(cuid())
+  signature            String   @unique
+  type                 String
+  slot                 BigInt
+  timestamp            DateTime
+  mint                 String
+  action               String // e.g. 'BUY' or 'SELL'
+  solAmount            Float?   @map("sol_amount")
+  tokenAmount          Float?   @map("token_amount")
+  isBuy                Boolean  @map("is_buy")
+  virtualSolReserves   Float?   @map("virtual_sol_reserves")
+  virtualTokenReserves Float?   @map("virtual_token_reserves")
+  realSolReserves      Float?   @map("real_sol_reserves")
+  realTokenReserves    Float?   @map("real_token_reserves")
+  programData          String?  @map("program_data") // maybe base64 or some encoded string
+
+  @@index([type])
+  @@index([mint])
+  @@index([action])
+  @@index([mint, action])
+  @@index([timestamp])
+  @@map("trade_token_event")
+}
+
+model GraduationTokenEvent {
+  id            String   @id @default(cuid())
+  type          String
+  signature     String   @unique
+  slot          BigInt
+  timestamp     DateTime
+  mint          String
+  bodingCurve   String?  @map("boding_curve")
+  wsolMint      String?  @map("wsol_mint")
+  poolAuthority String?  @map("pool_authority")
+
+  @@index([type])
+  @@index([mint])
+  @@index([timestamp])
+  @@map("graduation_token_event")
+}
+
+model TokenAthHistory {
+  id        String   @id @default(cuid())
+  mint      String
+  priceSol  Decimal  @map("price_sol")
+  priceUsd  Decimal? @map("price_usd")
+  signature String   @unique
+  slot      BigInt
+  timestamp DateTime @default(now())
+
+  @@index([mint])
+  @@map("token_ath_history")
+}
+
+model TokenAthCurrent {
+  mint      String   @id
+  priceSol  Decimal  @map("price_sol")
+  priceUsd  Decimal? @map("price_usd")
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@map("token_ath_current")
 }
