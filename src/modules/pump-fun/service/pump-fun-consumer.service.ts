@@ -8,19 +8,27 @@ import { TokenPrismaRepository } from "../db/repositories/prisma/token.prisma.re
 import Redis from "ioredis";
 import bs58 from 'bs58';
 import { StatisticsService } from "src/modules/statistics/services/statistics.service";
+import { GraduationParser } from "../parsers/graduate-parser";
 
-@Processor('pump-fun-event', { concurrency: 10, limiter: { max: 10, duration: 1000 } })
+@Processor('pump-fun-event',)
 export class PumpFunConsumerService extends WorkerHost {
   private redisPub: Redis;
 
   private connection: Connection
-  private readonly PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P')
+  private readonly PUMP_FUN_PROGRAM_ID: PublicKey
+
+  private cachedSolUsdRate: number = 0;
+  private rateLastFetched: number = 0;
 
   constructor(
     private readonly tokenRepository: TokenPrismaRepository,
     private readonly statisticsService: StatisticsService,
+
   ) {
     super();
+    if (!process.env.PROGRAM_ID) throw new Error('PROGRAM_ID env variable is not set');
+    this.PUMP_FUN_PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID);
+
     this.redisPub = new Redis({
       host: process.env.REDIS_HOST || 'localhost',
       port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
@@ -30,6 +38,28 @@ export class PumpFunConsumerService extends WorkerHost {
       process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
       { commitment: 'confirmed' }
     )
+
+    this.startSolUsdRateUpdater();
+  }
+
+  private async startSolUsdRateUpdater() {
+    const fetchRate = async () => {
+      try {
+        const resp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        const json = await resp.json();
+        const rate = json.solana?.usd;
+        if (typeof rate === 'number') {
+          this.cachedSolUsdRate = rate;
+          this.rateLastFetched = Date.now();
+        }
+      } catch (e) {
+        console.warn('Failed to update SOL→USD rate:', e);
+      }
+    };
+
+    await fetchRate();
+
+    setInterval(fetchRate, 60 * 1000);
   }
 
   async process(job: Job): Promise<any> {
@@ -48,33 +78,117 @@ export class PumpFunConsumerService extends WorkerHost {
 
       switch (eventType) {
         case PumpFunEventType.CREATE: {
-          parsedEvent = await this.parseCreateEvent(logs, signature, baseData)
+          parsedEvent = CreateParser.parseFromLogs(logs, this.PUMP_FUN_PROGRAM_ID, baseData);
 
-          const savedToken = await this.tokenRepository.saveToken(parsedEvent)
-          await this.redisPub.publish('token:created', JSON.stringify(savedToken, (_, value) =>
+          console.log(parsedEvent);
+
+
+          if (!parsedEvent || !parsedEvent.mint) {
+            return { status: 'skipped', reason: 'parsing_failed' };
+          }
+
+          const savedToken = await this.tokenRepository.saveCreateTokenEvent(parsedEvent)
+
+          const currentAth = await this.tokenRepository.getCurrentAth(parsedEvent.mint);
+          const tokenWithAth = {
+            ...savedToken,
+            currentAth: currentAth ? { priceSol: currentAth.priceSol, priceUsd: currentAth.priceUsd } : null
+          };
+
+          await this.redisPub.publish('token:created', JSON.stringify(tokenWithAth, (_, value) =>
             typeof value === 'bigint' ? value.toString() : value
           ));
 
           await this.statisticsService.incrementTokensCreated()
+          await this.statisticsService.incrementDbCount()
           await this.statisticsService.incrementTransaction()
           await this.statisticsService.publishStats()
-
-          console.log(savedToken);
           break
         }
 
         case PumpFunEventType.TRADE: {
           parsedEvent = this.parseTradeEvent(logs, signature, baseData);
-          const savedTrade = await this.tokenRepository.saveToken(parsedEvent);
+
+          if (!parsedEvent || !parsedEvent.mint) {
+            return { status: 'skipped', reason: 'parsing_failed' };
+          }
+
+          const isCreatedToken = await this.tokenRepository.existsCreatedToken(parsedEvent.mint);
+
+          if (!isCreatedToken) {
+            return { status: 'skipped', reason: 'token_not_observed_by_us' };
+          }
+
+          const savedTrade = await this.tokenRepository.saveTradeEvent(parsedEvent);
+
+          const priceSol = this.computePriceSol(parsedEvent.virtualSolReserves, parsedEvent.virtualTokenReserves);
+          const priceUsd = priceSol * this.cachedSolUsdRate;
+          const formattedUsd = this.formatUsd(priceUsd);
+
+          const currentAth = await this.tokenRepository.getCurrentAth(parsedEvent.mint);
+
+          if (!currentAth || priceUsd > Number(currentAth.priceUsd)) {
+            await this.tokenRepository.insertAthHistory({
+              mint: parsedEvent.mint,
+              priceSol,
+              signature,
+              slot: BigInt(slot),
+              timestamp: parsedEvent.timestamp,
+            })
+            await this.tokenRepository.upsertCurrentAth({
+              mint: parsedEvent.mint,
+              priceSol,
+            })
+
+            await this.statisticsService.incrementDbCount()
+
+            await this.redisPub.publish('token:athUpdated', JSON.stringify({
+              mint: parsedEvent.mint,
+              priceSol,
+              priceUsd,
+              formattedUsd,
+              timestamp: parsedEvent.timestamp,
+            }))
+          }
+
 
           await this.statisticsService.incrementTransaction()
+          await this.statisticsService.incrementDbCount()
           await this.statisticsService.publishStats()
-
-          console.log(savedTrade);
 
           await this.redisPub.publish('trade:detected', JSON.stringify(savedTrade, (_, value) =>
             typeof value === 'bigint' ? value.toString() : value
           ));
+          break;
+        }
+        case PumpFunEventType.GRADUATION: {
+          const parsedEvent = GraduationParser.parse(logs, this.PUMP_FUN_PROGRAM_ID, signature, slot, timestamp);
+          if (!parsedEvent) {
+            return { status: 'skipped', reason: 'parsing_failed' };
+          }
+
+          const isCreatedToken = await this.tokenRepository.existsCreatedToken(parsedEvent.tokenMint);
+
+          if (!isCreatedToken) {
+            return { status: 'skipped', reason: 'token_not_observed_by_us' };
+          }
+
+          const savedGraduation = await this.tokenRepository.saveGraduationEvent({ ...parsedEvent, signature, slot, timestamp });
+
+          const tokenData = await this.tokenRepository.getTokenByMint(parsedEvent.tokenMint);
+
+          await this.redisPub.publish('token:graduated', JSON.stringify({
+            graduationEvent: savedGraduation,
+            tokenData
+          }, (_, value) =>
+            typeof value === 'bigint' ? value.toString() : value
+          ));
+
+          await this.statisticsService.incrementTokenGraduated()
+          await this.statisticsService.incrementTransaction()
+          await this.statisticsService.incrementDbCount()
+          await this.statisticsService.publishStats()
+
           break;
         }
         default:
@@ -93,20 +207,11 @@ export class PumpFunConsumerService extends WorkerHost {
     }
   }
 
-  private async parseCreateEvent(logs: string[], signature: string, baseData: any) {
-    const tx = await this.safeGetTransaction(signature);
-    if (!tx) return null;
-
-    return CreateParser.parse(tx, this.PUMP_FUN_PROGRAM_ID, baseData);
-  }
-
   private parseTradeEvent(logs: string[], signature: string, baseData: any) {
-    const action: 'BUY' | 'SELL' = logs.includes('Buy') ? 'BUY' : 'SELL';
     const programDataLog = logs.find(log => log.startsWith('Program data: '));
 
     const result = {
       type: PumpFunEventType.TRADE,
-      action,
       ...baseData
     };
 
@@ -121,6 +226,7 @@ export class PumpFunConsumerService extends WorkerHost {
 
           return {
             ...result,
+            action: decoded.isBuy ? 'BUY' : 'SELL',
             mint: decoded.mint,
             solAmount: decoded.solAmount,
             tokenAmount: decoded.tokenAmount,
@@ -155,8 +261,8 @@ export class PumpFunConsumerService extends WorkerHost {
       const mint = bs58.encode(mintBytes);
       offset += 32;
 
-      const solAmountLamports = this.readU64LE(buffer, offset);
-      const solAmount = solAmountLamports / 1e9;
+      const solAmountRaw = this.readU64LE(buffer, offset);
+      const solAmount = solAmountRaw / 1e9;
       offset += 8;
 
       const tokenAmountRaw = this.readU64LE(buffer, offset);
@@ -164,6 +270,12 @@ export class PumpFunConsumerService extends WorkerHost {
       offset += 8;
 
       const isBuy = buffer.readUInt8(offset) === 1;
+      offset += 1;
+
+      const user = bs58.encode(buffer.subarray(offset, offset + 32));
+      offset += 32;
+
+      const timestamp = this.readU64LE(buffer, offset);
       offset += 8;
 
       const virtualSolReserves = this.readU64LE(buffer, offset) / 1e9;
@@ -178,15 +290,61 @@ export class PumpFunConsumerService extends WorkerHost {
       const realTokenReserves = this.readU64LE(buffer, offset) / 1e9;
       offset += 8;
 
+      const feeRecipient = bs58.encode(buffer.subarray(offset, offset + 32));
+      offset += 32;
+
+      const feeBps = buffer.readUInt16LE(offset);
+      offset += 2;
+
+      const fee = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const creator = bs58.encode(buffer.subarray(offset, offset + 32));
+      offset += 32;
+
+      const creatorFeeBps = buffer.readUInt16LE(offset);
+      offset += 2;
+
+      const creatorFee = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const trackVolume = buffer.readUInt8(offset) === 1;
+      offset += 1;
+
+      const totalUnclaimedTokens = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const totalClaimedTokens = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const currentSolVolume = this.readU64LE(buffer, offset) / 1e9;
+      offset += 8;
+
+      const lastUpdateTimestamp = this.readU64LE(buffer, offset);
+      offset += 8;
+
       return {
         mint,
         solAmount,
         tokenAmount,
         isBuy,
+        user,
+        timestamp,
         virtualSolReserves,
         virtualTokenReserves,
         realSolReserves,
         realTokenReserves,
+        feeRecipient,
+        feeBps,
+        fee,
+        creator,
+        creatorFeeBps,
+        creatorFee,
+        trackVolume,
+        totalUnclaimedTokens,
+        totalClaimedTokens,
+        currentSolVolume,
+        lastUpdateTimestamp,
       };
 
     } catch (e) {
@@ -204,54 +362,19 @@ export class PumpFunConsumerService extends WorkerHost {
     return Number(value);
   }
 
-  private parseFromLogs(logs: string[]) {
-    const nameLine = logs.find(l => l.includes('Token name:'));
-    const mintLine = logs.find(l => l.includes('Mint:'));
-    const symbolLine = logs.find(l => l.includes('Symbol:'));
-    const uriLine = logs.find(l => l.includes('URI:'));
-    const user = logs.find(l => l.includes('User:'));
-    const bondingCurve = logs.find(l => l.includes('Bonding curve:'));
-
-    console.log({
-      nameLine,
-      mintLine,
-      symbolLine,
-      uriLine,
-      user,
-      bondingCurve
-    });
-
-
-    if (!nameLine || !mintLine) return { complete: false };
-
-    return {
-      type: PumpFunEventType.CREATE,
-      complete: true,
-      name: nameLine.split(':')[1].trim(),
-      mint: mintLine.split(':')[1].trim(),
-      symbol: symbolLine ? symbolLine.split(':')[1].trim() : null,
-      uri: uriLine ? uriLine.split(':')[1].trim() : null,
-      user: user ? user.split(':')[1].trim() : null,
-      bondingCurve: bondingCurve ? bondingCurve.split(':')[1].trim() : null,
-    };
+  private computePriceSol(virtualSolReserves: number, virtualTokenReserves: number): number {
+    if (!virtualSolReserves || !virtualTokenReserves) return 0;
+    return (virtualSolReserves / virtualTokenReserves) * 1e6;
   }
 
-  private async safeGetTransaction(signature: string, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-      try {
-        const tx = await this.connection.getTransaction(signature, {
-          commitment: 'confirmed',
-          maxSupportedTransactionVersion: 0,
-        });
-        if (tx) return tx;
-      } catch (err: any) {
-        if (err.message.includes('429')) {
-          await new Promise(r => setTimeout(r, (i + 1) * 1500));
-        } else throw err;
-      }
+  private formatUsd(value: number): string {
+    if (value >= 1_000_000) {
+      return `$${(value / 1_000_000).toFixed(1)}M`;
     }
-    return null;
+    if (value >= 1_000) {
+      return `$${(value / 1_000).toFixed(1)}K`;
+    }
+    return `$${value.toFixed(2)}`;
   }
-
 
 }
